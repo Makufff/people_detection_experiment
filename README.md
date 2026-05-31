@@ -1,19 +1,27 @@
 # Solution — People Counting under a Same-Uniform Crowd
 
-Count the distinct people who pass through a busy entrance where **everyone
-wears the same uniform**. Self-contained pipeline:
+Count people who pass through a busy entrance where **everyone wears the same
+uniform**. The same pipeline can report either:
 
-**YOLO26 (detect) → ByteTrack (track) → re-id (motion + optional face) → floor-zone unique count**
+| mode | command switch | meaning |
+|---|---|---|
+| **unique count** | default | merge broken tracklets with re-id, then count each identity once |
+| **non-unique / raw tracker count** | `--no-stitch` | skip re-id and count raw ByteTrack track IDs that enter the zone |
+
+Self-contained pipeline:
+
+**YOLO26 (detect) → ByteTrack (track) → optional re-id → floor-zone count**
 
 ```bash
-# from the repo root (auto-downloads yolo26l.pt, ~53 MB, first run)
-uv run python solution/count_people.py --device 0 --no-display
+# from solution/ (auto-downloads yolo26l.pt, ~53 MB, first run)
+uv run python -m pkg.pipeline --device 0 --no-display
 #   -> solution/result.mp4        (labelled video, H.264)
 #   -> solution/counted_crops/    (one crop image per counted person)
 #   -> prints: PEOPLE IN VIDEO (unique) = N
 ```
 
-For the entrypoint with the bundled sample video, run:
+For the preset entrypoint with pose enabled and the bundled sample video, run
+from the repo root:
 
 ```bash
 uv run python solution/main.py
@@ -28,7 +36,44 @@ uv run python solution/main.py /path/to/video.mp4
 uv run python solution/main.py entrance.mov
 ```
 
+For full CLI control, run from `solution/`:
+
+```bash
+# unique count, default re-id ON
+uv run python -m pkg.pipeline --video video/entrance.mov --device 0 --no-display
+
+# non-unique/raw tracker count, re-id OFF
+uv run python -m pkg.pipeline --video video/entrance.mov --no-stitch --device 0 --no-display
+```
+
 ---
+
+## Unique vs non-unique
+
+The counter always uses the same floor-zone rule: a track must have reliable
+feet inside the entrance zone for at least `--min-in-frames` frames.
+
+The difference is only the identity source:
+
+| mode | identity source | use when |
+|---|---|---|
+| **unique** | track IDs after motion re-id stitching, plus optional face re-id | you want approximate distinct people |
+| **non-unique / raw** | original ByteTrack IDs before stitching | you want a baseline showing tracker fragmentation |
+
+Turn re-id on/off like this:
+
+```bash
+# unique: re-id ON by default
+uv run python -m pkg.pipeline --video entrance.mov
+
+# non-unique/raw: re-id OFF
+uv run python -m pkg.pipeline --video entrance.mov --no-stitch
+```
+
+Important: `--no-stitch` is not a frame-by-frame occupancy count. It still
+counts one event per raw tracker ID that dwells in the floor zone. If one real
+person is split into three tracker IDs, non-unique mode may count that person
+three times.
 
 ## Why same-uniform is the hard part — and how we beat it
 
@@ -70,16 +115,17 @@ were correctly excluded from the zone trigger, and pose tracking fragmented less
 spurious zone entries from partial boxes. Slower than plain detection (pose head)
 but more accurate; recommended when accuracy matters more than speed.
 
-Counting then happens in a **rectified top-down floor zone**: a person is counted
-once their feet dwell on the doorway floor patch for `--min-in-frames` frames.
+Counting then happens in a **rectified top-down floor zone**: an identity is
+counted once its feet dwell on the doorway floor patch for `--min-in-frames`
+frames.
 People milling deep in the dark interior have their feet *above* the zone, so
 their churn fragments never inflate the count.
 
 ```
-frame ─► YOLO26 + ByteTrack ─► feet point (bbox bottom-centre)
-      ─► motion gap re-association  [+ optional face retrieval]   ← solves same-uniform
+frame ─► YOLO26 + ByteTrack ─► feet point (bbox bottom-centre or pose ankle)
+      ─► optional motion gap re-association  [+ optional face retrieval]
       ─► 4-point homography → top-down floor view
-      ─► count distinct identities dwelling in the ENTRANCE FLOOR ZONE
+      ─► count identities dwelling in the ENTRANCE FLOOR ZONE
 ```
 
 ---
@@ -88,7 +134,7 @@ frame ─► YOLO26 + ByteTrack ─► feet point (bbox bottom-centre)
 
 | | count | note |
 |---|---|---|
-| no re-id (raw zone presence) | ~97–100 | ID churn over-counts |
+| non-unique/raw (`--no-stitch`) | ~97–100 | ID churn over-counts because one person can become multiple track IDs |
 | motion re-id, no turn fix | 77 | turn-arounds still double-counted |
 | **motion re-id + turn-around (default)** | **72** | YOLO26: 266 fragments → ~140 people → 72 in the entrance zone |
 | **+ pose foot anchor (`--pose`)** | **70** | ankle-based feet + drops 508 upper-body-only triggers; tracks cleaner (169 fragments) |
@@ -108,6 +154,7 @@ settings and a range, rather than a single number on faith.
                           #   and ignore upper-body-only (arm) detections in the zone
 --max-gap / --max-dist    # motion re-id strength (↑ merges more fragments)
 --turn-gap 25             # turn-around (front/back) re-id window; ↑ catches slower turns
+--no-stitch               # disable motion re-id; reports raw/non-unique tracker count
 --min-in-frames 8         # dwell frames in the zone before counting
 --sweep                   # re-count across re-id strengths instantly (uses cache)
 --preview                 # draw the floor zone on one frame and exit
@@ -117,8 +164,10 @@ settings and a range, rather than a single number on faith.
 ```
 
 The first run does one detection pass and caches boxes to
-`solution/tracks_cache.csv`; afterwards `--sweep` and re-counts are instant.
-Re-run detection with `--retrack` (e.g. after changing `--model`).
+`solution/tracks_cache.csv`; afterwards `--sweep`, unique re-counts, and
+`--no-stitch` raw re-counts reuse the same cache. Re-run detection with
+`--retrack` after changing detector settings such as `--model`, `--pose`,
+`--imgsz`, `--conf`, or `--iou`.
 
 ---
 
@@ -131,7 +180,7 @@ the resulting file:
 
 ```bash
 cd face_embedding && uv run --with onnxruntime python extract_face_embeddings.py
-cd .. && uv run python solution/count_people.py --face-embeddings face_embeddings.npz --face-sim 0.5
+cd ../solution && uv run python -m pkg.pipeline --face-embeddings ../face_embeddings.npz --face-sim 0.5
 ```
 
 **On this particular footage it is OFF by default and not recommended**: the
@@ -146,14 +195,13 @@ See `../FACE_REID.md` for the full measured evidence.
 | file | purpose |
 |---|---|
 | `main.py` | entrypoint; accepts an optional custom video path |
-| `count_people.py` | CLI entrypoint; keeps the old command stable |
-| `people_counter/cli.py` | command-line options and defaults |
-| `people_counter/tracking.py` | YOLO/pose tracking, body-part gate, cache loading |
-| `people_counter/reid.py` | motion stitch + optional face identity merge |
-| `people_counter/counting.py` | unique-zone count and optional direction count |
-| `people_counter/geometry.py` | homography, BEV transform, zone test |
-| `people_counter/output.py` | preview images, annotated video, counted crops |
-| `people_counter/pipeline.py` | high-level orchestration of the stages |
+| `pkg/cli.py` | command-line options and defaults |
+| `pkg/tracking.py` | YOLO/pose tracking, body-part gate, cache loading |
+| `pkg/reid.py` | motion stitch + optional face identity merge |
+| `pkg/counting.py` | zone count and optional direction count |
+| `pkg/geometry.py` | homography, BEV transform, zone test |
+| `pkg/output.py` | preview images, annotated video, counted crops |
+| `pkg/pipeline.py` | high-level orchestration of the stages |
 | `bytetrack_tuned.yaml` | ByteTrack config tuned to reduce ID churn |
 | `result.mp4` | annotated output video |
 | `counted_crops/` | one crop per counted person, in count order |
